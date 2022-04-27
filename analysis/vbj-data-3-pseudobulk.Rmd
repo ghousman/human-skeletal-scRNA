@@ -1,0 +1,636 @@
+---
+title: "vbj-data-pseudobulk"
+author: "Genevieve Housman"
+date: "April 2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 10X Data Cellranger Analysis - Differential Expression
+
+Test for differential expression between humans and chimpanzees within different cell classifications.
+https://combine-australia.github.io/RNAseq-R/06-rnaseq-day1.html
+
+```{r, message=FALSE}
+
+#Load libraries
+library(Seurat)
+library(dplyr)
+library(stringi)
+library(stringr)
+library(ggplot2)
+library(grid)
+library(gbm)
+library(colorspace)
+library(RColorBrewer)
+library(edgeR)
+library(scran)
+library(SingleCellExperiment)
+library(limma)
+library(variancePartition)
+#library(EnhancedVolcano)
+library(purrr)
+library(UpSetR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(Rgraphviz)
+library(enrichplot)
+library(viridis)
+library(RUVSeq)
+library(BiocParallel)
+
+#detectCores()
+register(SnowParam(4, "SOCK", progressbar=TRUE))
+
+```
+
+## Prepare data
+
+```{r, eval=FALSE}
+
+#Load data
+#data integrated across individuals - total (conservative cell filter + non-zero genes + regress out UMI/mito)
+scrna <- "./data/cellranger-data-full/data.filterC.log.indv-cell.intNo0.reg-tot.assign.rds"
+data <- readRDS(scrna)
+
+#Define individual-replicate sets
+data@meta.data$Individual.Replicate <- paste0(data@meta.data$Individual,".",data@meta.data$Replicate)
+
+```
+
+Define genes of interest: all except mitochondrial genes and ribosomal genes
+
+```{r, eval=FALSE}
+
+genes <- rownames(data@assays$RNA@counts)
+genes.mito <- c("MT-ATP6","MT-ATP8","MT-CO1","MT-CO2","MT-CO3","MT-CYB","MT-ND1","MT-ND2","MT-ND3","MT-ND4","MT-ND4L","MT-ND5")
+genes.ribo <- grep('^RP',genes,value=T)
+genes.no.mito.ribo <- genes[which(!(genes %in% c(genes.mito,genes.ribo)))]
+rm(genes,genes.mito,genes.ribo)
+
+```
+
+Define data subsets for testing DE methods.
+
+```{r, eval=FALSE}
+
+#dataSub <- subset(data,subset=Stage=="Time 2")
+#dataSub <- subset(data,subset=Cluster0.05=="iPSC.c3")
+dataSub <- subset(data,subset=OstAdHoc.Assign.x.4gene.thresh0=="mineralizing osteoblast")
+dataSub <- subset(data,subset=OstAdHoc.Assign.x.4gene.thresh0=="mineralizing osteoblast" & Stage=="Time 2")
+dataSub <- subset(data,subset=OstAdHoc.Assign.x.4gene.thresh0=="maturing osteocyte")
+dataSub <- subset(data,subset=OstAdHoc.Assign.x.4gene.thresh0=="maturing osteocyte" & Stage=="Time 2")
+
+#dataSub <- subset(dataSub,subset=Sample!="H1-I")
+#dataSub <- subset(dataSub,subset=Sample!="C1-I")
+#dataSub <- subset(dataSub,subset=Sample!="H1-I-r2")
+#dataSub <- subset(dataSub,subset=Sample!="C1-I-r2")
+
+#human.cells <- rownames(dataSub@meta.data)[which(dataSub@meta.data$Species=="Human")]
+#chimp.cells <- rownames(dataSub@meta.data)[which(dataSub@meta.data$Species=="Chimp")]
+#h.cell.sub <- human.cells[sample(1:length(human.cells), 200, replace=FALSE)]
+#c.cell.sub <- chimp.cells[sample(1:length(chimp.cells), 200, replace=FALSE)]
+#dataSub <- subset(dataSub,cells=c(h.cell.sub,c.cell.sub))
+
+```
+
+When performing DE analyses with pseudobulk data (across individuals and replicates), use raw counts only as this worked the best.
+
+```{r, eval=FALSE}
+
+#make pseudobulk using individual+replicate information
+counts <- c()
+metadata <- c()
+labels <- c()
+for (i in unique(dataSub@meta.data$Individual.Replicate)) {
+      x.lab <- i
+      w <- which(dataSub@meta.data$Individual.Replicate==i)
+      if (length(w)>0) {
+        x.spp <- dataSub@meta.data$Species[w][1]
+        x.col <- dataSub@meta.data$Collection[w][1]
+        x.ind <- dataSub@meta.data$Individual[w][1]
+        x.rep <- dataSub@meta.data$Replicate[w][1]
+        if (length(w)==1) {
+          x.cnt <- dataSub@assays$RNA@counts[,w]
+        } else {
+          x.cnt <- Matrix::rowSums(dataSub@assays$RNA@counts[,w])
+        }
+        counts <- cbind(counts, x.cnt)
+        metadata <- rbind(metadata, c(x.lab, x.spp, x.col, x.ind, x.rep))
+        labels <- c(labels, x.lab)
+      }
+}
+colnames(counts) <- labels
+rownames(metadata) <- labels
+colnames(metadata) <- c("Individual.Replicate","Species","Collection","Individual","Replicate")
+metadata <- as.data.frame(metadata)
+
+```
+
+## Identify differentially expressed genes
+
+There are several ways of doing this. Here, we chose to use: dream (a limma voom method)
+
+* dream = differential expression for repeated measures
+
+* method uses a linear model model to increase power and decrease false positives for RNA-seq datasets with multiple measurements per individual
+
+* first, uses voomWithDreamWeights() to estimate precision weights (model measurement error in gene counts)
+
+    + estimates the mean-variance relationship of logcpm
+    + uses this to compute observation-level weights
+
+* second, uses dream() for linear mixed modelling and regression coefficient estimation
+
+    + model fit on each gene (random effects estimated separately for each gene)
+    + uses the Satterthwaite approximation for the hypothesis test
+
+* finally, uses an exact test with FDR control to determine DE genes
+
+    + dream uses an estimated degrees of freedom value for each hypothsis test, so the degrees of freedom is different for each gene and the t-statistics are not directly comparable
+    + comparing test statistics can instead be done using z.std (p-value transformed into a signed z-score)
+
+* also tried edgeRQLF (Han et al. 2015) and FindMarkers (McDavid et al. 2013), but these resulted in inflatted p-values and generally did not work as well (see v2-20x-data-5-diffexp.Rmd for more details).
+
+References:
+
+* https://github.com/csoneson/conquer_comparison/blob/master/scripts/apply_voomlimma.R
+* https://www.bioconductor.org/packages/devel/bioc/vignettes/variancePartition/inst/doc/dream.html#:~:text=1%3A1000%2C%5D-,Limma%20Analysis,the%20same%20across%20all%20genes
+* https://genomebiology.biomedcentral.com/articles/10.1186/gb-2014-15-2-r29
+
+```{r, eval=FALSE}
+
+runDREAM <- function(dataSub, data.dir, cell.assign, cell.subset, genes.no.mito.ribo, data.type, filter.arg, filter.type, filter.param, fml) {
+
+  #make count matrix and metadata for edgeR object
+  if (data.type=="pseudo") {
+    counts <- c()
+    metadata <- c()
+    labels <- c()
+    for (i in unique(dataSub@meta.data$Individual.Replicate)) {
+      x.lab <- i
+      w <- which(dataSub@meta.data$Individual.Replicate==i)
+      if (length(w)>0) {
+        x.spp <- dataSub@meta.data$Species[w][1]
+        x.col <- dataSub@meta.data$Collection[w][1]
+        x.ind <- dataSub@meta.data$Individual[w][1]
+        x.rep <- dataSub@meta.data$Replicate[w][1]
+        if (length(w)==1) {
+          x.cnt <- dataSub@assays$RNA@counts[,w]
+        } else {
+          x.cnt <- Matrix::rowSums(dataSub@assays$RNA@counts[,w])
+        }
+        counts <- cbind(counts, x.cnt)
+        metadata <- rbind(metadata, c(x.lab, x.spp, x.col, x.ind, x.rep))
+        labels <- c(labels, x.lab)
+      }
+    }
+    colnames(counts) <- labels
+    rownames(metadata) <- labels
+    colnames(metadata) <- c("Individual.Replicate","Species","Collection","Individual","Replicate")
+    metadata <- as.data.frame(metadata)
+    rm(labels)
+  }
+  if (data.type=="sc") {
+    counts <- as.matrix(GetAssayData(dataSub, assay="RNA", slot="counts"))
+    metadata <- dataSub@meta.data[,c("Species","Individual.Replicate","Individual","Replicate","Collection","percent.mt","Phase","Sample")]
+    metadata <- metadata[colnames(counts),]
+  }
+
+  #remove mitochodrial and ribosomal genes
+  counts <- counts[which(rownames(counts) %in% genes.no.mito.ribo),]
+
+  #make edgeR object
+  dge <- DGEList(counts)
+  meta_dge <- dge$samples[,c("lib.size","norm.factors")]
+  meta_dge <- cbind(meta_dge, metadata)
+  dge$samples <- meta_dge
+  rm(dataSub,counts,metadata,meta_dge)
+
+  #filter genes
+  if (filter.arg==TRUE){
+    if (filter.type=="logcpm"){
+      keep <- rowMeans(edgeR::cpm(dge,log=TRUE,prior.count=0.25))>0
+      dge$counts <- dge$counts[keep,]
+    }
+    if (filter.type=="min.count"){
+      keep <- filterByExpr(dge, group=dge$samples$Species, min.count=filter.param, min.total.count=15)
+      table(keep)
+      dge <- dge[keep, , keep.lib.sizes=FALSE]
+      rm(keep)
+    }
+    if (filter.type=="pch"){
+      dge$counts <- dge$counts[rowSums(dge$counts!=0)>=(filter.param*dim(dge$counts)[2]),]
+    }
+  }
+  
+  #normalize data
+  dge <- calcNormFactors(dge, method="TMM")
+  summary(dge$samples$norm.factors)
+  
+  #calculate cellular detection rate - THIS IS NOT NECESSARY
+  #cdr <- scale(colMeans(dge$count > 0))
+  
+  #prep variables for design matrix
+  dge$samples$Individual.Replicate <- as.factor(dge$samples$Individual.Replicate)
+  dge$samples$Individual <- as.factor(dge$samples$Individual)
+  dge$samples$Replicate <- as.factor(as.character(dge$samples$Replicate))
+  #dge$samples$Sample <- as.factor(dge$samples$Sample) #NOT USED
+  dge$samples$Species <- as.factor(dge$samples$Species)
+  dge$samples$Collection <- as.factor(as.numeric(dge$samples$Collection))
+  #dge$samples$SequencingBatch <- as.factor(as.numeric(dge$samples$SequencingBatch)) #NOT USED
+  if (data.type=="sc") {
+    dge$samples$Phase <- as.factor(dge$samples$Phase)
+    dge$samples$Sample <- as.factor(dge$samples$Sample)
+    dge$samples$S.G2M.Diff <- dge$samples$S.Score - dge$samples$G2M.Score #NOT USED
+  }
+  
+  #calculate RUV factors from replicates - INCLUDING RUVS DOES NOT IMPROVE PSEUDOBULK DATA CLUSTERING BY SPECIES AND INDIVIDUAL
+  tmm <- edgeR::cpm(dge,normalized.lib.sizes=TRUE,log=TRUE,prior.count=0.25)
+  #plotMDS(dge$counts,top=dim(dge)[1],gene.selection="pairwise",col=c(rep("darkgreen",7),rep("darkorange",7)))
+  #plotMDS(tmm,top=dim(dge)[1],gene.selection="pairwise",col=c(rep("darkgreen",7),rep("darkorange",7)))
+  differences <- t(makeGroups(dge$samples$Replicate))
+  tmm.1 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=1, scIdx=differences)
+  tmm.2 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=2, scIdx=differences)
+  tmm.3 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=3, scIdx=differences)
+  tmm.4 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=4, scIdx=differences)
+  tmm.5 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=5, scIdx=differences)
+  tmm.6 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=6, scIdx=differences)
+  tmm.7 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=7, scIdx=differences)
+  tmm.8 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=8, scIdx=differences)
+  tmm.9 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=9, scIdx=differences)
+  tmm.10 <- RUVs(dge$counts, cIdx=rownames(dge$counts), k=10, scIdx=differences)
+  plotMDS(tmm,top=dim(dge)[1],gene.selection="pairwise",col=c(rep("darkgreen",7),rep("darkorange",7)))
+  plotMDS(tmm.1$normalizedCounts,top=dim(dge)[1],gene.selection="pairwise",col=c(rep("darkgreen",7),rep("darkorange",7)))
+  
+  #design matrix - THOUGHT ABOUT SO MANY FORMULAS, BUT DECIDED THAT SPP+IND MAKES THE MOST SENSE AND MINIMIZES P INFLATION
+  #model <- "~Collection+nCount_RNA+percent.mt+Phase+(1|Individual)+(1|Replicate)+Species"
+  #formula <- ~Collection+nCount_RNA+percent.mt+Phase+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+Species
+  #formula <- ~Phase+Species
+  formula <- ~(1|Individual)+Species
+  #formula <- ~cdr+(1|Individual)+Species
+  #formula <- ~percent.mt+(1|Individual)+Species
+  #formula <- ~Phase+(1|Individual)+Species
+  #formula <- ~percent.mt+Phase+(1|Individual)+Species
+  #formula <- ~percent.mt+S.G2M.Diff+(1|Individual)+Species
+  #formula <- ~S.G2M.Diff+(1|Individual)+Species
+  #formula <- ~(1|Replicate)+Species
+  #formula <- ~cdr+(1|Replicate)+Species
+  #formula <- ~Phase+(1|Replicate)+Species
+  #formula <- ~S.G2M.Diff+(1|Replicate)+Species
+  #formula <- ~percent.mt+Phase+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~percent.mt+S.G2M.Diff+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~(1|Sample)+Species
+  #formula <- ~(1|Sample)+(1|Individual)+Species
+  #formula <- ~(1|Sample)+(1|Replicate)+Species
+  #formula <- ~(1|Sample)+percent.mt+Species
+  #formula <- ~(1|Sample)+Phase+Species
+  #formula <- ~(1|Sample)+Phase+percent.mt+Species
+  #formula <- ~(1|Sample)+(1|Replicate)+percent.mt+Species
+  #formula <- ~(1|Individual)+(1|Replicate)+Species
+  #formula <- Individual+Species
+  #formula <- ~Phase+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~S.G2M.Diff+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+(1|Sample)+Species
+  #formula <- ~Collection+Phase+percent.mt+(1|Sample)+Species
+  #formula <- ~Collection+(1|Individual)+Species
+  #formula <- ~Collection+Phase+(1|Individual)+Species
+  #formula <- ~Collection+Phase+percent.mt+(1|Individual)+Species
+  #formula <- ~Collection+S.G2M.Diff+(1|Individual)+Species
+  #formula <- ~Collection+(1|Replicate)+Species
+  #formula <- ~Collection+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+Phase+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+S.G2M.Diff+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+Phase+percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+cdr+Species
+  #formula <- ~Collection+cdr+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+SequencingBatch+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~cdr+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+Phase+(1|Individual)+Species
+  #formula <- ~SequencingBatch+Phase+percent.mt+(1|Individual)+Species
+  #formula <- ~SequencingBatch+Phase+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+S.G2M.Diff+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+Phase+percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+SequencingBatch+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~Collection+SequencingBatch+percent.mt+(1|Individual)+(1|Replicate)+Species
+  #formula <- ~SequencingBatch+(1|Sample)+Species
+  
+  #estimate weights using linear mixed model of dream (voom)
+  vobjDream = voomWithDreamWeights(dge, formula, dge$samples)
+  
+  #define contrasts - NOT NECESSARY
+  #L = getContrast(vobjDream, formula, dge$samples, coefficient="SpeciesHuman")
+  #plotContrasts(L)
+
+  #fit dream model on each gene
+  #fitmm = dream(vobjDream, formula, dge$samples, L)
+  fitmm = dream(vobjDream, formula, dge$samples)
+
+  #assess differential expression output for particular contrast
+  tt <- topTable(fitmm, n=Inf, coef='SpeciesHuman', adjust.method="BH", p.value=1)
+  print("All DE Genes")
+  print(dim(tt))
+  print(table(tt$adj.P.Val<0.01))
+  #print(table(tt$adj.P.Val<0.05))
+  print(summary(decideTests(fitmm, adjust.method="BH", p.value=0.01)))
+  #print(summary(decideTests(fitmm, adjust.method="BH", p.value=0.05)))
+  #print(summary(decideTests(fitmm, adjust.method="BH", p.value=0.01, lfc=abs(1.2)))) #DON'T ADJUST LOGFC DURING TEST
+
+  hist(tt$logFC)
+  hist(tt$adj.P.Val)
+  plot(tt$logFC, -log10(tt$adj.P.Val))
+  qqplot(-log10(runif(length(tt$adj.P.Val))),
+         -log10(tt$adj.P.Val),
+         xlab="-log10(Uniform)",
+         ylab="-log10(Adjusted p-Value)",
+         main=paste0("QQ Plot"))
+  
+  abline(0,1)
+  
+  #assess variance partitioning - more variance explained by individual than species (which explains more than collection)
+  #formula.x = ~(1|Species)+(1|Individual)+(1|Collection)
+  formula.x = ~(1|Individual)+(1|Species)
+  vp = fitExtractVarPartModel(vobjDream, formula.x, dge$samples)
+  plotVarPart(sortCols(vp))
+  
+  #add details to output
+  tt$data <- rep(scrna, dim(tt$table)[1])
+  tt$cell.assign <- rep(cell.assign, dim(tt$table)[1])
+  tt$cell.subset <- rep(cell.subset, dim(tt$table)[1])
+  tt$gene.filter <- rep(filter.arg, dim(tt$table)[1])
+  tt$gene.filter.args <- rep(paste0("min.count=",min.count), dim(tt$table)[1])
+  tt$model <- rep(model, dim(tt$table)[1])
+  tt$comparison <- rep(tt$comparison, dim(tt$table)[1])
+  tt$test <- rep(tt$test, dim(tt$table)[1])
+  tt$adjust.method <- rep(tt$adjust.method, dim(tt$table)[1])
+
+  return(tt)
+
+}
+
+```
+
+## Scripts for DE tests
+
+Run DE analysis on cluster using one of the following scripts.
+
+DEdream.R
+
+* This script examines pairwise DE in defined subsets of the data:
+
+    + Stages of differentiation: Time 0, Time 1, Time 2
+    + Unsupervised clustering (res=0.05): iPSC.c1, iPSC.c2, iPSC.c3, MSC.c1, Osteogenic.c1, Osteogenic.c2
+    + Unsupervised clustering (res=0.05): iPSC clusters (iPSC.c1, iPSC.c2, iPSC.c3), MSC clusters (MSC.c1), Osteogenic clusters (Osteogenic.c1, Osteogenic.c2)
+    + General ad hoc assignments: iPSCs, MSCs, Osteogenic cells
+    + Osteogenic ad hoc asssignments: preosteoblasts, osteoblasts, embedding osteoblasts, mineralizing osteoblasts, maturing osteocytes
+    + Osteogenic ad hoc asssignments (Time 2 cells only): preosteoblasts, osteoblasts, embedding osteoblasts, mineralizing osteoblasts, maturing osteocytes
+
+* Several arguments can be supplied into this script:
+
+    + name = unique character string to use for output file
+    + data.source = which data integration to use (tot, t0, t1, t2)
+    + data.type = whether DE test should be run on pseudobulk or single-cell data (pseudo, sc)
+    + filter.arg = whether gene set for DE test should be filtered or not (TRUE, FALSE)
+    + filter.type = what parameter should gene set be filtered on (logcpm, min.count, pch)
+    + filter.param = numeric value indicating the minimum threshold that retained genes should meet for the provided filter.type
+    + fml = formula for linear mixed model (see formula list below)
+    + assign = which cell assignments should pairwise tests be performed in (all, stage, cluster, adhoc, ostadhoc, ostadhocX, ostadhoc.T2, ostadhocX.T2)
+    + lfc = whether logFC should be adjusted in DE test (NOTE: always set to FALSE)
+    + fdr = which FDR method should be used in DE test (NOTE: always set to BH)
+
+DEdreamsubset.R
+
+* This script examines pairwise DE in defined subsets of the data (see above), with the option of subsetting the data in the following ways:
+
+    + replicate 1 samples removed
+    + replicate 2 samples removed
+    + cells within a given assignment subsetted to smallest number across species
+
+* Several arguments can be supplied into this script:
+
+    + name = unique character string to use for output file
+    + data.source = which data integration to use (tot, t0, t1, t2)
+    + data.type = whether DE test should be run on pseudobulk or single-cell data (NOTE: always set to pseudo)
+    + subset.rep = which data subsetting should be performed (keepRep1, keepRep2, subNum)
+    + subset.num = whether cells within a given assignment subsetted to smallest number across species (TRUE, FALSE)
+    + filter.arg = whether gene set for DE test should be filtered or not (TRUE, FALSE)
+    + filter.type = what parameter should gene set be filtered on (logcpm, min.count, pch)
+    + filter.param = numeric value indicating the minimum threshold that retained genes should meet for the provided filter.type
+    + fml = formula for linear mixed model (see formula list below)
+    + assign = which cell assignments should pairwise tests be performed in (all, stage, cluster, adhoc, ostadhoc, ostadhocX, ostadhoc.T2, ostadhocX.T2)
+    + lfc = whether logFC should be adjusted in DE test (NOTE: always set to FALSE)
+    + fdr = which FDR method should be used in DE test (NOTE: always set to BH)
+
+Different formulas options:
+
+* pseudobulk:
+
+    + formula1: ~Species+(1|Individual)+(1|Replicate)
+    + formula2: ~Species+Collection+percent.mt+Phase+(1|Individual)
+    + formula3: ~Species+percent.mt+Phase+(1|Sample)
+    + formula4: ~Species+(1|Individual)+(1|Replicate)
+    + formula5: ~Species+(1|Individual)
+    + formula6: ~Species+(1|Individual)
+    
+* single-cell:
+
+    + formula1: ~Species+(1|Individual)+(1|Replicate)
+    + formula2: ~Species+Collection+percent.mt+Phase+(1|Individual)
+    + formula3: ~Species+percent.mt+Phase+(1|Sample)
+    + formula4: ~Species+percent.mt+Phase+(1|Individual)+(1|Replicate)
+    + formula5: ~Species+percent.mt+Phase+(1|Individual)
+    + formula6: ~Species+percent.mt+Phase+(1|Individual.Replicate)
+
+Decided to proceed with the following:
+
+* pseudocounts calculated as sum of raw single-cell UMI counts within each individual-replicate
+* genes filtered to only those with average log2cpm>0 in the particular dataset being tested
+* TMM normalized pseudocounts and calculated cpm (prior.count=0.25)
+* identified DE using limma+voom (via dream)
+* formula6: ~Species+(1|Individual)
+* FDR<0.01
+
+```{bash, eval=FALSE}
+
+#run DEdream.sh/DEdream.R and DEdreamsubset.sh/DEdreamsubset.R on cluster
+
+cd /project2/gilad/ghousman/skeletal-human-chimp/human-chimp-skeletal-scRNA/code/
+
+#pseudobulk DE analyses
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 stage
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 cluster
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 adhoc
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostcluster0.50
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostcluster0.75
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostcluster0.50.T2
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostcluster0.75.T2
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostadhoc
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostadhocX
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostadhoc.T2
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml6.nofc.bh tot pseudo TRUE logcpm 0 formula6 ostadhocX.T2
+
+#pseudobulk DE analyses with replicate 1 samples removed
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 stage
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 cluster
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 adhoc
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostcluster0.50
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostcluster0.75
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostcluster0.50.T2
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostcluster0.75.T2
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostadhoc
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostadhocX
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostadhoc.T2
+sbatch ./DEdreamsubset.sh tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh tot keepRep1 FALSE TRUE logcpm 0 formula6 ostadhocX.T2
+
+#pseudobulk DE analyses with replicate 2 samples removed
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 stage
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 cluster
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 adhoc
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostcluster0.50
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostcluster0.75
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostcluster0.50.T2
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostcluster0.75.T2
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostadhoc
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostadhocX
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostadhoc.T2
+sbatch ./DEdreamsubset.sh tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh tot keepRep2 FALSE TRUE logcpm 0 formula6 ostadhocX.T2
+
+#pseudobulk DE analyses with cells subsetted to smallest number across species
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 stage
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 cluster
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 adhoc
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostcluster0.50
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostcluster0.75
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostcluster0.50.T2
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostcluster0.75.T2
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostadhoc
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostadhocX
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostadhoc.T2
+sbatch ./DEdreamsubset.sh tot.subNum.pseudo.logcpm0.fml6.nofc.bh tot subNum TRUE TRUE logcpm 0 formula6 ostadhocX.T2
+
+#single-cell DE analyses - NOT RUN
+#sbatch ./DEdream.sh tot.sc.pch20.fml6.nofc.bh tot sc TRUE pch 0.2 formula6 stage
+
+#pseudobulk DE analyses - check Cormotif model (~Species)
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml7.nofc.bh tot pseudo TRUE logcpm 0 formula7 stage
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml7.nofc.bh tot pseudo TRUE logcpm 0 formula7 ostadhoc
+sbatch ./DEdream.sh tot.pseudo.logcpm0.fml7.nofc.bh tot pseudo TRUE logcpm 0 formula7 ostadhoc.T2
+
+```
+
+## Do a quick check of DE gene data output.
+
+Similar trends in DE gene numbers seen when replicate 1 samples removed, replicate 2 samples removed, or cells are subsetted to smallest number across species.
+
+```{r, eval=FALSE}
+
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.stage.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.cluster.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.adhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.T2.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.T2.rds")
+
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.stage.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.cluster.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.adhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.T2.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep1.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.T2.rds")
+
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.stage.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.cluster.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.adhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.T2.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.keepRep2.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.T2.rds")
+
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.stage.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.cluster.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.adhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.50.T2.rds")
+#compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostcluster0.75.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostadhoc.T2.rds")
+compare <- readRDS("./data/de-data/DEdream.tot.subNum.pseudo.logcpm0.fml6.nofc.bh.ostadhocX.T2.rds")
+
+colnames(compare)[5] <- "FDR"
+
+#DE genes
+compare$DEgene <- compare$FDR<0.01
+#compare$DEgene <- (compare$FDR<0.05 & abs(compare$logFC)>0.5)
+#compare$DEgene <- (compare$FDR<0.01 & abs(compare$logFC)>1.2)
+
+#numbers of genes (total and DE)
+table(compare$cell.subset)
+#table(compare$cell.subset[which(compare$FDR<0.1)])
+#table(compare$cell.subset[which(compare$FDR<0.05)])
+table(compare$cell.subset[which(compare$FDR<0.01)])
+#table(compare$cell.subset[which(compare$FDR<0.05 & abs(compare$logFC)>.5)])
+#table(compare$cell.subset[which(compare$FDR<0.05 & abs(compare$logFC)>1.2)])
+#table(compare$cell.subset[which(compare$FDR<0.01 & abs(compare$logFC)>1.2)])
+
+#logFC
+ggplot(compare, aes(x=logFC)) +
+  geom_histogram(binwidth=0.2) +
+  facet_grid(~cell.subset)
+
+#FDR
+ggplot(compare, aes(x=FDR)) +
+  geom_histogram(binwidth=0.05) +
+  facet_grid(~cell.subset)
+
+#change FDR=0 to lowest non-zero FDR value
+for (i in unique(compare$cell.subset)) {
+  compare$FDR[which(compare$FDR==0 & compare$cell.subset==i)] <- min(compare$FDR[which(compare$FDR!=0 & compare$cell.subset==i)])
+}
+
+#volcano plot
+ggplot(compare, aes(x=logFC,y=-log10(FDR),color=DEgene)) +
+  geom_point() +
+  scale_color_manual(values=c("TRUE"="red","FALSE"="black")) +
+  geom_vline(xintercept=c(-0.5,0.5)) +
+  geom_hline(yintercept=-log10(0.01)) +
+  facet_grid(~cell.subset)
+#EnhancedVolcano(compare,lab=rownames(compare),x="logFC",y="FDR")
+
+#qqplot
+par(mfrow=c(1,length(unique(compare$cell.subset))))
+for (i in unique(compare$cell.subset)) {
+  qqplot(-log10(runif(length(compare$FDR[which(compare$cell.subset==i)]))),
+       -log10(compare$FDR[which(compare$cell.subset==i)]),
+       xlab="-log10(Uniform)",
+       ylab="-log10(FDR)",
+       main=paste0("QQ Plot: ",i))
+  abline(0,1)
+}
+
+```
