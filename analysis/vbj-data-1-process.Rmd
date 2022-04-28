@@ -213,7 +213,6 @@ while (i <= length(batch$Sample_Name_at_Core)) {
 
 ```
 
-### PICK UP FROM HERE
 Add metadata to count matrices.
 
 ```{r process scRNA data - add mitochondrial metadata, eval=FALSE, echo=TRUE}
@@ -222,39 +221,13 @@ Add metadata to count matrices.
 data <- list()
 for (i in 1:length(batch$Sample_Name_at_Core)) {
   print(i)
-  data[[i]] <- readRDS(paste0("./data/cellranger-data-full/h.c.dat.spp.",batch$Sample_Name_at_Core[i],".rds"))
+  data[[i]] <- readRDS(paste0("./data/h.data.",batch$Sample_Name_at_Core[i],".rds"))
 }
 
-#Identify mitochondrial genes (should be 12 genes total) and add percent of mitochondrial reads vs. total reads
-#which(sapply(data[[i]]@assays$RNA@counts@Dimnames[[1]], stri_count_regex, pattern="MT-")==1)
-#MT-CO2   16608
-#MT-CYB   16616
-#MT-ND2   16635
-#MT-ND5   16643
-#MT-CO1   16654
-#MT-ND3   16676
-#MT-ND4   16701
-#MT-ND1   16703
-#MT-ATP6  16709
-#MT-CO3   16732
-#MT-ND4L  17250
-#MT-ATP8  17689
-#INMT-MINDY4  18276 - not actually a mitochondrial gene
-mito <- c("MT-ATP6","MT-ATP8","MT-CO1","MT-CO2","MT-CO3","MT-CYB","MT-ND1","MT-ND2","MT-ND3","MT-ND4","MT-ND4L","MT-ND5")
-for (i in 1:length(data)) { data[[i]]$percent.mt <- PercentageFeatureSet(data[[i]], features=mito) }
-
-```
-
-```{r load files with other relevant metadata, eval=FALSE, echo=TRUE}
-
-#Load batch data
+#Load additional batch data
 batch <- read.csv(file='./data/scrna-batch-reformat.csv', header=TRUE, sep=",")
 batch[,c(1:7,9:10,21,24:25)] <- lapply(batch[,c(1:7,9:10,21,24:25)], function(x) as.character(x)) #names, sex, dates
 batch[,c(8,11:20,22:23,25:26)] <- lapply(batch[,c(8,11:20,22:23,25:26)], function(x) as.numeric(as.character(x))) #numeric values only
-
-```
-
-```{r process scRNA data - add other relevant metadata, eval=FALSE, echo=TRUE}
 
 #Add additional details to list
 
@@ -328,14 +301,39 @@ for (i in c(3,6,9,12,15,18,21)) { data[[i]]$Stage <- "Time 2" }
 
 ```
 
-```{r, eval=FALSE, echo=TRUE}
+Merge datasets into one Seurat object.
+
+```{r}
+
+#Merge data
+h.data <- merge(data[[1]],
+                y=c(data[[2]],data[[3]],
+                    data[[4]],data[[5]],data[[6]],
+                    data[[7]],data[[8]],data[[9]],
+                    data[[10]],data[[11]],data[[12]],
+                    data[[13]],data[[14]],data[[15]],
+                    data[[16]],data[[17]],data[[18]],
+                    data[[19]],data[[20]],data[[21]]),
+                        add.cell.ids=c("H1.I","H1.M","H1.O",
+                                       "H1r2.I","H1r2.M","H1r2.O",
+                                       "H2.I","H2.M","H2.O",
+                                       "H3.I","H3.M","H3.O",
+                                       "H4.I","H4.M","H4.O",
+                                       "H5.I","H5.M","H5.O",
+                                       "H6.I","H6.M","H6.O"),
+                        project="h.data")
+
+#Define individual-replicate sets
+h.data@meta.data$Individual.Replicate <- paste0(h.data@meta.data$Individual,".",h.data@meta.data$Replicate)
 
 #Save data
-saveRDS(data, file="./data/cellranger-data-full/data.rds")
+saveRDS(h.data, file = "./data/h.data.rds")
 
 ```
 
-### Export processed count matrices for GEO
+### PICK UP FROM HERE
+
+## Export processed count matrices for GEO
 
 Processed data for pilot eQTL paper
 
