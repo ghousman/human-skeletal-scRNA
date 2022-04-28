@@ -299,6 +299,9 @@ for (i in c(1,4,7,10,13,16,19)) { data[[i]]$Stage <- "Time 0" }
 for (i in c(2,5,8,11,14,17,20)) { data[[i]]$Stage <- "Time 1" }
 for (i in c(3,6,9,12,15,18,21)) { data[[i]]$Stage <- "Time 2" }
 
+#Save data
+saveRDS(data, file="./data/tmp.data.rds")
+
 ```
 
 Merge datasets into one Seurat object.
@@ -327,84 +330,38 @@ h.data <- merge(data[[1]],
 h.data@meta.data$Individual.Replicate <- paste0(h.data@meta.data$Individual,".",h.data@meta.data$Replicate)
 
 #Save data
-saveRDS(h.data, file = "./data/h.data.rds")
+saveRDS(h.data, file="./data/h.data.rds")
 
 ```
 
-### PICK UP FROM HERE
-
 ## Export processed count matrices for GEO
 
-Processed data for pilot eQTL paper
+Processed GHO-3 data with other GHO datasets
 
 ```{r, eval=FALSE}
 
 #Load and add metadata to GHO-3
-dataGHO3 <- readRDS(paste0("./data/cellranger-data-full/h.data.GHO-3.rds"))
-#percent mitochondria
-mito <- c("MT-ATP6","MT-ATP8","MT-CO1","MT-CO2","MT-CO3","MT-CYB","MT-ND1","MT-ND2","MT-ND3","MT-ND4","MT-ND4L","MT-ND5")
-dataGHO3$percent.mt <- PercentageFeatureSet(dataGHO3, features=mito)
+dataGHO3 <- readRDS(paste0("./data/h.data.GHO-3.rds"))
 #collection
 dataGHO3$Collection <- 0
 #cell type anticipated based on stage of differentiation at collection
 dataGHO3$Cell.Type <- "Chondrogenic"
 #individual cell line used in collection
-dataGHO3$Individual <- NA
-dataGHO3$Individual[which(dataGHO3$Species=="Human")] <- "H1"
-dataGHO3$Individual[which(dataGHO3$Species=="Chimp")] <- "C1"
+dataGHO3$Individual <- "H1"
 #replicate in overall study design
 dataGHO3$Replicate <- "1"
-#msc media
-dataGHO3$MSCmedia <- "3B"
 #abbreviation of sample name in collection
-dataGHO3$Sample <- NA
-dataGHO3$Sample[which(dataGHO3$Individual=="H1")] <- "H1-C" 
-dataGHO3$Sample[which(dataGHO3$Individual=="C1")] <- "C1-C" 
+dataGHO3$Sample <- "H1-C" 
 #several details on cell line and collection
 dataGHO3$Sex <- "M"
-dataGHO3$Age <- NA
-dataGHO3$Age[which(dataGHO3$Individual=="H1")] <- 22
-dataGHO3$Age[which(dataGHO3$Individual=="C1")] <- 16
-dataGHO3$DateCollection <- "6/5/2019"
-dataGHO3$Number6W <- 3
-dataGHO3$PrewashCount <- NA
-dataGHO3$PrewashCount[which(dataGHO3$Individual=="H1")] <- 1025000
-dataGHO3$PrewashCount[which(dataGHO3$Individual=="C1")] <- 0.575
-dataGHO3$PrewashViability <- NA
-dataGHO3$PrewashViability[which(dataGHO3$Individual=="H1")] <- 2440000
-dataGHO3$PrewashViability[which(dataGHO3$Individual=="C1")] <- 0.48
-dataGHO3$PostwashCount <- NA
-dataGHO3$PostwashCount[which(dataGHO3$Individual=="H1")] <- 440000
-dataGHO3$PostwashCount[which(dataGHO3$Individual=="C1")] <- 445000
-dataGHO3$PostwashViability <- NA
-dataGHO3$PostwashViability[which(dataGHO3$Individual=="H1")] <- 0.75
-dataGHO3$PostwashViability[which(dataGHO3$Individual=="C1")] <- 0.6
-dataGHO3$PostmixCount <- 425000
-dataGHO3$PostmixViability <- 0.75
-dataGHO3$DatecDNA <- "6/5/2019"
-dataGHO3$DateLibrary <- "6/10/2019"
-dataGHO3$SequencingBatch <- 1
-#facs information (control)
-dataGHO3$CD90_Control <- NA
-dataGHO3$CD73_Control <- NA
-dataGHO3$CD105_Control <- NA
-dataGHO3$CD45.CD34.CD11b.CD19.HLA.DR_Control <- NA
-#facs information (cocktail) 
-dataGHO3$CD90 <- NA
-dataGHO3$CD73 <- NA
-dataGHO3$CD105 <- NA
-dataGHO3$CD45.CD34.CD11b.CD19.HLA.DR <- NA
-#alizarin red data
-dataGHO3$Alizarin <- NA
-#oil red data (put with MSCs and osteogenic cells)
-dataGHO3$OilRed <- NA
+dataGHO3$Age <- 22
 #cell classification information - stage of differentiation at collection
 dataGHO3$Stage <- "Time 3"
 
 #####
 
 #Read in remaining data
-data <- readRDS("./data/cellranger-data-full/data.rds")
+data <- readRDS("./data/tmp.data.rds")
 
 #Rename cells
 data[[1]] <- RenameCells(data[[1]], add.cell.id="GHO-1")
@@ -426,13 +383,13 @@ tbl.met <- rbind(as.data.frame(data[[1]]@meta.data)[,-c(1:3)],
 
 #Save processed data
 write.table(tbl.cnt, 
-            file="./data/cellranger-data-full/GHO_count.csv", 
+            file="./data/GHO_count.csv", 
             sep=',',
             row.names=T,
             col.names=T,
             quote=F)
 write.table(tbl.met, 
-            file="./data/cellranger-data-full/GHO_meta.csv", 
+            file="./data/GHO_meta.csv", 
             sep=',',
             row.names=T,
             col.names=T,
@@ -440,44 +397,9 @@ write.table(tbl.met,
 
 ```
 
-```{bash, eval=FALSE}
-#easiest to do this on the computing cluster
+### PICK UP FROM HERE
 
-#Make folder containing files to be uploaded to GEO
-cd /project2/gilad/ghousman
-mkdir geo_GHO_20210218
-cd geo_GHO_20210218
-mkdir data_raw
-mkdir data_proc
-cd data_proc
-cp /project2/gilad/ghousman/skeletal-human-chimp/human-chimp-skeletal-scRNA/data/cellranger-data-full/GHO_count.csv ./GHO_count.csv
-cp /project2/gilad/ghousman/skeletal-human-chimp/human-chimp-skeletal-scRNA/data/cellranger-data-full/GHO_meta.csv ./GHO_meta.csv
-md5sum *
-#manually added file checksum to metadata file
-cd ..
-cd data_raw
-cp -r /project2/gilad/ghousman/skeletal-human-chimp/scRNA/190621_K00242_0576_AH7G3JBBXY_YG-GH-10X-4S-ln1/H7G3JBBXY_6/*/*.fastq.gz .
-cp -r /project2/gilad/ghousman/skeletal-human-chimp/scRNA/190626_K00242_0578_AH77TNBBXY_YG-GH-10X-4S-ln2/H77TNBBXY_1/*/*.fastq.gz .
-cp -r /project2/gilad/ghousman/skeletal-human-chimp/scRNA/190726_K00242_0593_BH77N2BBXY_YG-GH-10X-4S-xtra-ln1/H77N2BBXY_7/*/*.fastq.gz .
-cp -r /project2/gilad/ghousman/skeletal-human-chimp/scRNA/190730_K00242_0594_BH7N3HBBXY_YG-GH-10X-4S-xtra-ln2/H7N3HBBXY_3/*/*.fastq.gz .
-rm *_I1_*.fastq.gz
-md5sum *
-#manually added file checksum to metadata file
-#manually transferred metadata file to geo_GHO_20210218 via FileZilla
-
-#Upload files to GEO
-cd /project2/gilad/ghousman
-sftp geoftp@sftp-private.ncbi.nlm.nih.gov
-cd uploads/ghousman_SbedAyUe
-mkdir geo_GHO_20210218
-put -R /project2/gilad/ghousman/geo_GHO_20210218
-
-#Remove files for GEO
-cd /project2/gilad/ghousman
-rm -r geo_GHO_20210218
-```
-
-Processed data remaining for comparative osteogenesis paper
+Processed data remaining for bvj osteogenesis paper
 
 ```{r, eval=FALSE}
 
