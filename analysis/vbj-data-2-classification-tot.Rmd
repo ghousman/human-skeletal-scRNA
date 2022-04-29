@@ -15,11 +15,11 @@ knitr::opts_chunk$set(echo = TRUE)
 
 Transfer cell classification assignments from Housman et al (2022) PLOS Genetics (GSE181744) to new data.
 
-*stages of differentiation (Stage)
-*general unsupervised clusters (Cluster0.05)
-*general ad hoc assignments (AdHoc.Assign.thresh0)
-*detailed unsupervised clusters (Cluster0.50)
-*osteogenic ad hoc assignments (OstAdHoc.Assign.4gene.thresh0)
+* stages of differentiation (Stage)
+* general unsupervised clusters (Cluster0.05)
+* general ad hoc assignments (AdHoc.Assign.thresh0)
+* detailed unsupervised clusters (Cluster0.50)
+* osteogenic ad hoc assignments (OstAdHoc.Assign.4gene.thresh0)
 
 ```{r, message=FALSE}
 
